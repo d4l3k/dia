@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
 from torch import Tensor
 from torch.nn import RMSNorm
+import numpy as np
 
 from .config import DiaConfig
 from .state import DecoderInferenceState, EncoderInferenceState, KVCache
@@ -44,20 +45,43 @@ class DenseGeneral(nn.Module):
         self.out_features = out_features
         self.axis = axis
         self.kernel_shape = self.in_shapes + self.out_features
+        self.weight_dtype = weight_dtype
+
+        device = device or "cuda"
 
         factory_kwargs = {"device": device, "dtype": weight_dtype}
-        self.weight = nn.Parameter(torch.empty(self.kernel_shape, **factory_kwargs))
+        #self.weight = nn.Parameter(torch.empty(self.kernel_shape, **factory_kwargs))
+
+        self.linear = nn.Linear(np.prod(self.in_shapes),
+                                np.prod(self.out_features), bias=False,
+                                device=device, dtype=weight_dtype)
+        self.register_load_state_dict_pre_hook(self.patch_state_dict)
+        self.register_load_state_dict_post_hook(self.post_hook)
+
+    def patch_state_dict(self, module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        assert len(state_dict) == 1
+
+        og_key = prefix+"weight"
+        weight = state_dict[og_key]
+        del state_dict[og_key]
+
+        new_weight = weight.flatten(0, len(self.in_shapes)-1)
+        new_weight = new_weight.flatten(1, len(self.out_features))
+        new_weight = new_weight.permute(1, 0)
+
+        state_dict[prefix+"linear.weight"] = new_weight
+
+    def post_hook(self, module, incompatible_keys):
+        assert len(incompatible_keys.missing_keys) == 0, incompatible_keys
+        assert len(incompatible_keys.unexpected_keys) == 0, incompatible_keys
+
 
     def forward(self, inputs: Tensor) -> Tensor:
-        norm_axis = _normalize_axes(self.axis, inputs.ndim)
-        kernel_contract_axes = tuple(range(len(norm_axis)))
-
-        output = torch.tensordot(
-            inputs.to(self.weight.dtype),
-            self.weight,
-            dims=(norm_axis, kernel_contract_axes),
-        ).to(inputs.dtype)
-        return output
+        x = inputs.flatten(-len(self.in_shapes), -1)
+        #x = x.to(self.weight_dtype)
+        x = self.linear(x)
+        x = x.unflatten(-1, self.out_features)
+        return x
 
 
 class MlpBlock(nn.Module):
@@ -261,7 +285,7 @@ class Attention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous()  # (B, T, N, H)
         output = self.o_proj(attn_output)
 
-        return output.to(original_dtype)
+        return output#.to(original_dtype)
 
 
 class EncoderLayer(nn.Module):
